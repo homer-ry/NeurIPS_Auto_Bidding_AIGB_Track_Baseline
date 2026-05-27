@@ -1,0 +1,1 @@
+# DiT baseline for bidding
