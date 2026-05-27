@@ -43,7 +43,8 @@ def run_decision_diffuser(
             start_time = time.time()
 
             # 训练
-            all_loss, (diffuse_loss, inv_loss) = algorithm.trainStep(states, actions, returns, masks)
+            train_result = algorithm.trainStep(states, actions, returns, masks)
+            all_loss, (diffuse_loss, inv_loss) = train_result[:2]
             all_loss = all_loss.detach().clone()
             diffuse_loss = diffuse_loss.detach().clone()
             inv_loss = inv_loss.detach().clone()
