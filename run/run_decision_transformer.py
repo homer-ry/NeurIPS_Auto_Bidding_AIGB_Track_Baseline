@@ -1,4 +1,10 @@
 import numpy as np
+import argparse
+import os
+import sys
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from bidding_train_env.common.utils import normalize_state, normalize_reward, save_normalize_dict
 from bidding_train_env.baseline.dt.utils import EpisodeReplayBuffer
 from bidding_train_env.baseline.dt.dt import DecisionTransformer
@@ -14,22 +20,21 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def run_dt():
-    train_model()
+def run_dt(epochs=100, batch_size=32, save_path="saved_model/DTtest"):
+    train_model(epochs=epochs, batch_size=batch_size, save_path=save_path)
 
 
-def train_model():
+def train_model(epochs=100, batch_size=32, save_path="saved_model/DTtest"):
     state_dim = 16
 
     replay_buffer = EpisodeReplayBuffer(16, 1, "./data/trajectory/trajectory_data.csv")
     save_normalize_dict({"state_mean": replay_buffer.state_mean, "state_std": replay_buffer.state_std},
-                        "saved_model/DTtest")
+                        save_path)
     logger.info(f"Replay buffer size: {len(replay_buffer.trajectories)}")
 
     model = DecisionTransformer(state_dim=state_dim, act_dim=1, state_mean=replay_buffer.state_mean,
                                 state_std=replay_buffer.state_std)
-    step_num = 10000
-    batch_size = 32
+    step_num = epochs
     sampler = WeightedRandomSampler(replay_buffer.p_sample, num_samples=step_num * batch_size, replacement=True)
     dataloader = DataLoader(replay_buffer, sampler=sampler, batch_size=batch_size)
 
@@ -41,7 +46,7 @@ def train_model():
         logger.info(f"Step: {i} Action loss: {np.mean(train_loss)}")
         model.scheduler.step()
 
-    model.save_net("saved_model/DTtest")
+    model.save_net(save_path)
     test_state = np.ones(state_dim, dtype=np.float32)
     logger.info(f"Test action: {model.take_actions(test_state)}")
 
@@ -59,5 +64,14 @@ def load_model():
     logger.info(f"Test action: {model.take_actions(test_state)}")
 
 
+def main():
+    parser = argparse.ArgumentParser(description="Train Decision Transformer for bidding")
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--save_path", type=str, default="saved_model/DTtest")
+    args = parser.parse_args()
+    run_dt(epochs=args.epochs, batch_size=args.batch_size, save_path=args.save_path)
+
+
 if __name__ == "__main__":
-    run_dt()
+    main()

@@ -1,4 +1,10 @@
 import torch
+import argparse
+import os
+import sys
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from bidding_train_env.baseline.dd.DFUSER import (DFUSER)
 import time
 from bidding_train_env.baseline.dd.dataset import aigb_dataset
@@ -50,5 +56,18 @@ def run_decision_diffuser(
     algorithm.save_net(save_path, epi)
 
 
+def main():
+    parser = argparse.ArgumentParser(description="Train Decision Diffuser for bidding")
+    parser.add_argument("--save_path", type=str, default="saved_model/DDtest")
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch_size", type=int, default=1000)
+    args = parser.parse_args()
+    run_decision_diffuser(
+        save_path=args.save_path,
+        train_epoch=args.epochs,
+        batch_size=args.batch_size,
+    )
+
+
 if __name__ == '__main__':
-    run_decision_diffuser()
+    main()
