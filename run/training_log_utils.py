@@ -1,4 +1,10 @@
 import math
+import os
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:
+    SummaryWriter = None
 
 
 class BatchMeanMeter:
@@ -41,3 +47,15 @@ def format_loss_for_log(value, precision=6):
     if abs_value >= 10_000:
         return f"{value:.4e}"
     return f"{value:.{precision}f}"
+
+
+def create_summary_writer(log_dir):
+    if SummaryWriter is None or not log_dir:
+        return None
+    os.makedirs(log_dir, exist_ok=True)
+    return SummaryWriter(log_dir)
+
+
+def add_scalar(writer, name, value, step):
+    if writer is not None:
+        writer.add_scalar(name, float(value), step)

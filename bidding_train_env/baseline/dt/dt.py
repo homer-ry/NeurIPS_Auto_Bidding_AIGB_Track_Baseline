@@ -213,11 +213,10 @@ class DecisionTransformer(nn.Module):
             states, actions, rewards, rtg[:, :-1], timesteps, attention_mask=attention_mask,
         )
 
-        act_dim = action_preds.shape[2]
-        action_preds = action_preds.reshape(-1, act_dim)[attention_mask.reshape(-1) > 0]
-        action_target = action_target.reshape(-1, act_dim)[attention_mask.reshape(-1) > 0]
-
-        loss = torch.mean((action_preds - action_target) ** 2)
+        token_loss = ((action_preds - action_target) ** 2).mean(dim=-1)
+        mask = attention_mask.float()
+        sample_loss = (token_loss * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
+        loss = sample_loss.mean()
 
         self.optimizer.zero_grad()
         loss.backward()

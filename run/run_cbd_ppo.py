@@ -31,10 +31,10 @@ from torch.utils.data import DataLoader, Subset
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bidding_train_env.baseline.ddpo.reward_model import TrajectoryRewardModel
+from bidding_train_env.baseline.ddpo.reward_model import TrajectoryRewardModel, UNetTrajectoryRewardModel
 from bidding_train_env.baseline.dit.DFUSER import DFUSER
 from bidding_train_env.baseline.dit.dataset import aigb_dataset
-from run.training_log_utils import parse_bool_arg
+from run.training_log_utils import BatchMeanMeter, add_scalar, create_summary_writer, parse_bool_arg
 
 
 logging.basicConfig(
@@ -345,7 +345,9 @@ def build_dataloader(
     return_transform: str,
     return_clip_quantile: float,
     top_return_quantile: float,
-) -> DataLoader:
+    val_ratio: float = 0.05,
+    seed: int = 2026,
+) -> Tuple[DataLoader, DataLoader]:
     dataset = aigb_dataset(
         step_len,
         load_preprocessed_tain_data=True,
@@ -367,53 +369,191 @@ def build_dataloader(
             len(dataset),
         )
         dataset = Subset(dataset, kept_indices)
+    if val_ratio > 0 and len(dataset) > 1:
+        val_size = max(1, int(len(dataset) * val_ratio))
+        train_size = len(dataset) - val_size
+        generator = torch.Generator().manual_seed(seed)
+        train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size], generator=generator)
+    else:
+        train_dataset = dataset
+        val_dataset = dataset
     dataloader = DataLoader(
-        dataset,
+        train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
         pin_memory=(torch.cuda.is_available() and num_workers > 0),
     )
-    logger.info("Dataset size: %s, batches: %s", len(dataset), len(dataloader))
-    return dataloader
+    val_dataloader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=(torch.cuda.is_available() and num_workers > 0),
+    )
+    logger.info(
+        "Dataset size: %s, train=%s batches=%s, val=%s batches=%s",
+        len(dataset),
+        len(train_dataset),
+        len(dataloader),
+        len(val_dataset),
+        len(val_dataloader),
+    )
+    return dataloader, val_dataloader
+
+
+def binary_auc_score(targets: np.ndarray, scores: np.ndarray) -> float:
+    targets = np.asarray(targets).reshape(-1)
+    scores = np.asarray(scores).reshape(-1)
+    finite_mask = np.isfinite(targets) & np.isfinite(scores)
+    targets = targets[finite_mask]
+    scores = scores[finite_mask]
+    if targets.size == 0:
+        return 0.5
+    threshold = np.median(targets)
+    labels = (targets > threshold).astype(np.int64)
+    pos = int(labels.sum())
+    neg = int(labels.size - pos)
+    if pos == 0 or neg == 0:
+        return 0.5
+    order = np.argsort(scores, kind="mergesort")
+    sorted_scores = scores[order]
+    ranks = np.empty(scores.size, dtype=np.float64)
+    start = 0
+    while start < scores.size:
+        end = start + 1
+        while end < scores.size and sorted_scores[end] == sorted_scores[start]:
+            end += 1
+        avg_rank = (start + 1 + end) / 2.0
+        ranks[order[start:end]] = avg_rank
+        start = end
+    pos_rank_sum = ranks[labels == 1].sum()
+    return float((pos_rank_sum - pos * (pos + 1) / 2.0) / (pos * neg))
+
+
+@torch.no_grad()
+def evaluate_reward_model(
+    reward_model: torch.nn.Module,
+    dataloader: DataLoader,
+    device: torch.device,
+    max_batches: Optional[int] = None,
+) -> Dict[str, float]:
+    reward_model.eval()
+    losses = BatchMeanMeter()
+    preds = []
+    targets = []
+    for batch_index, (states, actions, returns, masks) in enumerate(dataloader, start=1):
+        states = states.to(device)
+        actions = actions.to(device)
+        returns = returns.to(device)
+        masks = masks.to(device)
+        try:
+            pred_returns = reward_model(states, masks, actions=actions)
+        except TypeError:
+            pred_returns = reward_model(states, masks)
+        loss = torch.nn.functional.mse_loss(pred_returns, returns)
+        if torch.isfinite(loss):
+            losses.update(loss.item(), states.shape[0])
+            preds.append(pred_returns.detach().cpu().numpy())
+            targets.append(returns.detach().cpu().numpy())
+        if max_batches is not None and batch_index >= max_batches:
+            break
+    if losses.count == 0:
+        return {"loss": float("nan"), "mse": float("nan"), "auc": 0.5}
+    pred_array = np.concatenate(preds, axis=0).reshape(-1)
+    target_array = np.concatenate(targets, axis=0).reshape(-1)
+    reward_model.train()
+    return {
+        "loss": losses.mean,
+        "mse": float(np.mean((pred_array - target_array) ** 2)),
+        "auc": binary_auc_score(target_array, pred_array),
+    }
 
 
 def pretrain_reward_model(
     reward_model: TrajectoryRewardModel,
     dataloader: DataLoader,
+    val_dataloader: DataLoader,
     device: torch.device,
     epochs: int,
     lr: float,
     max_batches: Optional[int],
-) -> Tuple[TrajectoryRewardModel, torch.optim.Optimizer, List[float]]:
+    eval_max_batches: Optional[int],
+    writer=None,
+) -> Tuple[TrajectoryRewardModel, torch.optim.Optimizer, List[Dict[str, float]]]:
     optimizer = torch.optim.Adam(reward_model.parameters(), lr=lr)
-    history: List[float] = []
+    history: List[Dict[str, float]] = []
 
     reward_model.train()
     for epoch in range(1, epochs + 1):
-        losses = []
+        losses = BatchMeanMeter()
+        preds = []
+        targets = []
+        skipped_batches = 0
         pbar = tqdm.tqdm(dataloader, desc=f"RM Pretrain {epoch}", leave=False)
-        for batch_index, (states, _, returns, masks) in enumerate(pbar, start=1):
+        for batch_index, (states, actions, returns, masks) in enumerate(pbar, start=1):
             states = states.to(device)
+            actions = actions.to(device)
             returns = returns.to(device)
             masks = masks.to(device)
 
-            pred_returns = reward_model(states, masks)
+            try:
+                pred_returns = reward_model(states, masks, actions=actions)
+            except TypeError:
+                pred_returns = reward_model(states, masks)
             loss = torch.nn.functional.mse_loss(pred_returns, returns)
+            if not torch.isfinite(loss):
+                skipped_batches += 1
+                logger.warning(
+                    "Skipping non-finite RM batch %s: loss=%s states_finite=%s returns_finite=%s pred_finite=%s",
+                    batch_index,
+                    loss.item(),
+                    torch.isfinite(states).all().item(),
+                    torch.isfinite(returns).all().item(),
+                    torch.isfinite(pred_returns).all().item(),
+                )
+                continue
 
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(reward_model.parameters(), 1.0)
             optimizer.step()
 
-            losses.append(loss.item())
+            losses.update(loss.item(), states.shape[0])
+            preds.append(pred_returns.detach().cpu().numpy())
+            targets.append(returns.detach().cpu().numpy())
             pbar.set_postfix(loss=f"{loss.item():.5f}")
 
             if max_batches is not None and batch_index >= max_batches:
                 break
 
-        epoch_loss = float(np.mean(losses)) if losses else 0.0
-        history.append(epoch_loss)
-        logger.info("RM epoch %s: loss=%.6f", epoch, epoch_loss)
+        epoch_loss = losses.mean
+        train_pred = np.concatenate(preds, axis=0).reshape(-1) if preds else np.asarray([])
+        train_target = np.concatenate(targets, axis=0).reshape(-1) if targets else np.asarray([])
+        train_auc = binary_auc_score(train_target, train_pred) if preds else 0.5
+        val_metrics = evaluate_reward_model(reward_model, val_dataloader, device, max_batches=eval_max_batches)
+        epoch_metrics = {
+            "epoch": epoch,
+            "train_loss": epoch_loss,
+            "train_mse": float(np.mean((train_pred - train_target) ** 2)) if preds else float("nan"),
+            "train_auc": train_auc,
+            "val_loss": val_metrics["loss"],
+            "val_mse": val_metrics["mse"],
+            "val_auc": val_metrics["auc"],
+            "skipped_batches": skipped_batches,
+        }
+        history.append(epoch_metrics)
+        for key in ["train_loss", "train_mse", "train_auc", "val_loss", "val_mse", "val_auc", "skipped_batches"]:
+            add_scalar(writer, f"rm_pretrain/{key}", epoch_metrics[key], epoch)
+        logger.info(
+            "RM epoch %s: train_loss=%.6f train_auc=%.6f val_loss=%.6f val_auc=%.6f skipped_batches=%s",
+            epoch,
+            epoch_metrics["train_loss"],
+            epoch_metrics["train_auc"],
+            epoch_metrics["val_loss"],
+            epoch_metrics["val_auc"],
+            skipped_batches,
+        )
 
     return reward_model, optimizer, history
 
@@ -461,9 +601,15 @@ def train_cbd_ppo(
     max_grad_norm: float = 1.0,
     condition_steps: int = 24,
     cond_obs_training: bool = True,
+    rm_model: str = "unet",
+    rm_hidden_dim: int = 128,
+    rm_val_ratio: float = 0.05,
+    rm_eval_batches: Optional[int] = None,
+    tb_log_dir: str = "logs/tensorboard/cbd_ppo",
 ):
     device_obj = get_device(device)
     os.makedirs(save_path, exist_ok=True)
+    writer = create_summary_writer(tb_log_dir)
     logger.info("Using device: %s", device_obj)
 
     cbd_model = load_cbd_model(
@@ -472,7 +618,7 @@ def train_cbd_ppo(
         device=device_obj,
         cond_obs_training=cond_obs_training,
     )
-    dataloader = build_dataloader(
+    dataloader, val_dataloader = build_dataloader(
         cbd_model.step_len,
         batch_size=batch_size,
         num_workers=num_workers,
@@ -480,17 +626,33 @@ def train_cbd_ppo(
         return_transform=return_transform,
         return_clip_quantile=return_clip_quantile,
         top_return_quantile=top_return_quantile,
+        val_ratio=rm_val_ratio,
     )
-    reward_model = TrajectoryRewardModel(state_dim=16, hidden_dim=128).to(device_obj)
+    if rm_model == "unet":
+        reward_model = UNetTrajectoryRewardModel(
+            state_dim=16,
+            horizon=cbd_model.step_len,
+            hidden_dim=rm_hidden_dim,
+            emb_dim=rm_hidden_dim,
+            traj_add_a=False,
+        ).to(device_obj)
+    elif rm_model == "transformer":
+        reward_model = TrajectoryRewardModel(state_dim=16, hidden_dim=rm_hidden_dim).to(device_obj)
+    else:
+        raise ValueError(f"Unsupported rm_model: {rm_model}")
+    logger.info("Reward model: %s, parameters=%s", rm_model, sum(p.numel() for p in reward_model.parameters()))
 
     logger.info("Pretraining reward model...")
     reward_model, rm_optimizer, rm_pretrain_history = pretrain_reward_model(
         reward_model=reward_model,
         dataloader=dataloader,
+        val_dataloader=val_dataloader,
         device=device_obj,
         epochs=pretrain_rm_epochs,
         lr=reward_model_lr,
         max_batches=max_rm_batches,
+        eval_max_batches=rm_eval_batches,
+        writer=writer,
     )
     if not freeze_rm:
         logger.warning("DDPO mode freezes the reward model after pretraining to match the source project logic.")
@@ -512,7 +674,8 @@ def train_cbd_ppo(
         "condition_steps_mean": [],
         "diffuser_param_delta": [],
         "inv_param_delta": [],
-        "rm_pretrain_loss": rm_pretrain_history,
+        "rm_pretrain_loss": [item["train_loss"] for item in rm_pretrain_history],
+        "rm_pretrain_metrics": rm_pretrain_history,
     }
 
     best_reward = float("-inf")
@@ -548,10 +711,23 @@ def train_cbd_ppo(
         else:
             reward_model.train()
 
-        epoch_rm = []
-        epoch_reward_mean = []
-        epoch_reward_std = []
-        epoch_stats = []
+        epoch_rm = BatchMeanMeter()
+        epoch_reward_mean = BatchMeanMeter()
+        epoch_reward_std = BatchMeanMeter()
+        epoch_stats = {
+            key: BatchMeanMeter()
+            for key in [
+                "policy_loss",
+                "kl_penalty",
+                "total_loss",
+                "advantage_mean",
+                "advantage_std",
+                "ratio_mean",
+                "ratio_std",
+                "clip_fraction",
+                "condition_steps_mean",
+            ]
+        }
         latest_reward_mean = 0.0
         latest_reward_std = 0.0
 
@@ -561,9 +737,11 @@ def train_cbd_ppo(
             actions = actions.to(device_obj)
             returns = returns.to(device_obj)
             masks = masks.to(device_obj)
+            current_batch_size = states.shape[0]
 
             stats = trainer.train_step(states=states, returns=returns, masks=masks)
-            epoch_stats.append(stats)
+            for key, meter in epoch_stats.items():
+                meter.update(stats[key], current_batch_size)
 
             if freeze_rm:
                 with torch.no_grad():
@@ -591,9 +769,9 @@ def train_cbd_ppo(
                 reward_mean = latest_reward_mean
                 reward_std = latest_reward_std
 
-            epoch_rm.append(rm_loss.item())
-            epoch_reward_mean.append(reward_mean)
-            epoch_reward_std.append(reward_std)
+            epoch_rm.update(rm_loss.item(), current_batch_size)
+            epoch_reward_mean.update(reward_mean, current_batch_size)
+            epoch_reward_std.update(reward_std, current_batch_size)
 
             pbar.set_postfix(
                 ppo=f"{stats['policy_loss']:.4f}",
@@ -604,23 +782,10 @@ def train_cbd_ppo(
             if max_policy_batches is not None and batch_index >= max_policy_batches:
                 break
 
-        mean_rm = float(np.mean(epoch_rm)) if epoch_rm else 0.0
-        mean_reward = float(np.mean(epoch_reward_mean)) if epoch_reward_mean else 0.0
-        mean_reward_std = float(np.mean(epoch_reward_std)) if epoch_reward_std else 0.0
-        mean_stats = {
-            key: float(np.mean([item[key] for item in epoch_stats])) if epoch_stats else 0.0
-            for key in [
-                "policy_loss",
-                "kl_penalty",
-                "total_loss",
-                "advantage_mean",
-                "advantage_std",
-                "ratio_mean",
-                "ratio_std",
-                "clip_fraction",
-                "condition_steps_mean",
-            ]
-        }
+        mean_rm = epoch_rm.mean
+        mean_reward = epoch_reward_mean.mean
+        mean_reward_std = epoch_reward_std.mean
+        mean_stats = {key: meter.mean for key, meter in epoch_stats.items()}
         policy_delta = _l2_delta(initial_policy_params, cbd_model.diffuser.model)
         inv_delta = _l2_delta(initial_inv_params, cbd_model.diffuser.inv_model)
 
@@ -632,6 +797,13 @@ def train_cbd_ppo(
         training_history["reward_std"].append(mean_reward_std)
         training_history["diffuser_param_delta"].append(policy_delta)
         training_history["inv_param_delta"].append(inv_delta)
+        for key, value in mean_stats.items():
+            add_scalar(writer, f"cbd_ppo/{key}", value, epoch)
+        add_scalar(writer, "cbd_ppo/rm_loss", mean_rm, epoch)
+        add_scalar(writer, "cbd_ppo/reward_mean", mean_reward, epoch)
+        add_scalar(writer, "cbd_ppo/reward_std", mean_reward_std, epoch)
+        add_scalar(writer, "cbd_ppo/diffuser_param_delta", policy_delta, epoch)
+        add_scalar(writer, "cbd_ppo/inv_param_delta", inv_delta, epoch)
 
         logger.info(
             "Epoch %s: ppo=%.6f kl=%.6f rm=%.6f reward=%.6f±%.6f ratio=%.4f clip=%.4f policy_delta=%.6f inv_delta=%.6f",
@@ -680,6 +852,8 @@ def train_cbd_ppo(
 
     logger.info("Training completed. Final model: %s", os.path.join(save_path, "diffuser.pt"))
     logger.info("Best generated reward: %.6f", best_reward)
+    if writer is not None:
+        writer.close()
     return cbd_model, reward_model, training_history
 
 
@@ -716,6 +890,11 @@ def main():
     parser.add_argument("--kl_coef", type=float, default=0.1)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--condition_steps", type=int, default=24)
+    parser.add_argument("--rm_model", type=str, default="unet", choices=["unet", "transformer"])
+    parser.add_argument("--rm_hidden_dim", type=int, default=128)
+    parser.add_argument("--rm_val_ratio", type=float, default=0.05)
+    parser.add_argument("--rm_eval_batches", type=int, default=None)
+    parser.add_argument("--tb_log_dir", type=str, default="logs/tensorboard/cbd_ppo")
     parser.add_argument(
         "--cond_obs_training",
         type=parse_bool_arg,
@@ -758,6 +937,11 @@ def main():
         max_grad_norm=args.max_grad_norm,
         condition_steps=args.condition_steps,
         cond_obs_training=args.cond_obs_training,
+        rm_model=args.rm_model,
+        rm_hidden_dim=args.rm_hidden_dim,
+        rm_val_ratio=args.rm_val_ratio,
+        rm_eval_batches=args.rm_eval_batches,
+        tb_log_dir=args.tb_log_dir,
     )
 
 

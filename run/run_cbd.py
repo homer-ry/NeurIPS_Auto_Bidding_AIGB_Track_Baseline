@@ -18,6 +18,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bidding_train_env.baseline.dit.DFUSER import DFUSER
 from bidding_train_env.baseline.dit.dataset import aigb_dataset
+from run.training_log_utils import BatchMeanMeter, add_scalar, create_summary_writer, format_loss_for_log
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,6 +42,8 @@ def run_cbd_training(
     traj_add_a=False,
     rtg_preference='score',
     save_every=20,
+    num_workers=2,
+    tb_log_dir="logs/tensorboard/cbd",
 ):
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     os.makedirs(save_path, exist_ok=True)
@@ -50,6 +53,7 @@ def run_cbd_training(
     logger.info(f"Batch size: {batch_size}")
     logger.info(f"Diffusion steps: {n_timesteps}")
     logger.info(f"Model: {model_choice} (CBD)")
+    writer = create_summary_writer(tb_log_dir)
 
     algorithm = DFUSER(
         dim_obs=16,
@@ -78,8 +82,8 @@ def run_cbd_training(
         dataset,
         batch_size=int(batch_size),
         shuffle=True,
-        num_workers=2,
-        pin_memory=True,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
     )
 
     logger.info(f"Dataset size: {len(dataset)}")
@@ -88,30 +92,38 @@ def run_cbd_training(
     best_loss = float('inf')
 
     for epoch in tqdm.tqdm(range(1, train_epoch + 1), desc='Training CBD'):
-        epoch_loss = 0.0
-        epoch_diff = 0.0
-        epoch_inv = 0.0
-        n = 0
+        epoch_loss = BatchMeanMeter()
+        epoch_diff = BatchMeanMeter()
+        epoch_inv = BatchMeanMeter()
 
         for states, actions, returns, masks in dataloader:
             states = states.to(device)
             actions = actions.to(device)
             returns = returns.to(device)
             masks = masks.to(device)
+            current_batch_size = states.shape[0]
 
             loss, (diff_loss, inv_loss), _ = algorithm.trainStep(states, actions, returns, masks)
 
-            epoch_loss += loss.item()
-            epoch_diff += diff_loss.item()
-            epoch_inv += inv_loss.item() if inv_loss is not None else 0.0
-            n += 1
+            epoch_loss.update(loss.item(), current_batch_size)
+            epoch_diff.update(diff_loss.item(), current_batch_size)
+            epoch_inv.update(inv_loss.item() if inv_loss is not None else 0.0, current_batch_size)
 
-        avg_loss = epoch_loss / max(n, 1)
-        avg_diff = epoch_diff / max(n, 1)
-        avg_inv = epoch_inv / max(n, 1)
+        avg_loss = epoch_loss.mean
+        avg_diff = epoch_diff.mean
+        avg_inv = epoch_inv.mean
+        add_scalar(writer, "cbd/loss_mean", avg_loss, epoch)
+        add_scalar(writer, "cbd/diff_mean", avg_diff, epoch)
+        add_scalar(writer, "cbd/inv_mean", avg_inv, epoch)
 
         if epoch % 10 == 0 or epoch == 1:
-            logger.info(f"Epoch {epoch}: loss={avg_loss:.6f}, diff={avg_diff:.6f}, inv={avg_inv:.6f}")
+            logger.info(
+                "Epoch %s: loss_mean=%s, diff_mean=%s, inv_mean=%s",
+                epoch,
+                format_loss_for_log(avg_loss),
+                format_loss_for_log(avg_diff),
+                format_loss_for_log(avg_inv),
+            )
 
         if avg_loss < best_loss:
             best_loss = avg_loss
@@ -122,7 +134,9 @@ def run_cbd_training(
 
     algorithm.save_net(save_path, save_name='')
     logger.info(f"Training completed. Final model: {save_path}/diffuser.pt")
-    logger.info(f"Best loss: {best_loss:.6f}")
+    logger.info("Best loss_mean: %s", format_loss_for_log(best_loss))
+    if writer is not None:
+        writer.close()
 
 
 def main():
@@ -141,6 +155,8 @@ def main():
     parser.add_argument('--traj_add_a', action='store_true', default=False)
     parser.add_argument('--rtg_preference', type=str, default='score', choices=['reward', 'score'])
     parser.add_argument('--save_every', type=int, default=20)
+    parser.add_argument('--num_workers', type=int, default=2)
+    parser.add_argument('--tb_log_dir', type=str, default='logs/tensorboard/cbd')
     args = parser.parse_args()
 
     run_cbd_training(
@@ -158,6 +174,8 @@ def main():
         traj_add_a=args.traj_add_a,
         rtg_preference=args.rtg_preference,
         save_every=args.save_every,
+        num_workers=args.num_workers,
+        tb_log_dir=args.tb_log_dir,
     )
 
 

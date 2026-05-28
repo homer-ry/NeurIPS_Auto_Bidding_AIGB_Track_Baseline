@@ -17,6 +17,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bidding_train_env.baseline.dit.DFUSER import DFUSER
 from bidding_train_env.baseline.dit.dataset import aigb_dataset
+from run.training_log_utils import BatchMeanMeter, add_scalar, create_summary_writer, format_loss_for_log
 
 # 配置日志
 logging.basicConfig(
@@ -43,7 +44,9 @@ def run_dit_training(
         pred_one_step=False,
         traj_add_a=False,
         rtg_preference='score',
-        save_every=100
+        save_every=100,
+        num_workers=2,
+        tb_log_dir="logs/tensorboard/dit",
     ):
     
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -52,6 +55,7 @@ def run_dit_training(
     logger.info(f"Batch size: {batch_size}")
     logger.info(f"Diffusion steps: {n_timesteps}")
     logger.info(f"Model: {model_choice} with {attn_block} attention")
+    writer = create_summary_writer(tb_log_dir)
     
     # 创建保存目录
     os.makedirs(save_path, exist_ok=True)
@@ -98,8 +102,8 @@ def run_dit_training(
         dataset, 
         batch_size=int(batch_size), 
         shuffle=True, 
-        num_workers=2, 
-        pin_memory=True
+        num_workers=num_workers, 
+        pin_memory=torch.cuda.is_available()
     )
     
     logger.info(f"Dataset size: {len(dataset)}")
@@ -109,17 +113,17 @@ def run_dit_training(
     best_loss = float('inf')
     
     for epoch in tqdm.tqdm(range(1, train_epoch + 1), desc='Training DiT'):
-        record_epoch_loss = 0.
-        record_epoch_diff_loss = 0.
-        record_epoch_inv_loss = 0.
-        record_epoch_a_t_loss = 0.
-        num_batches = 0
+        record_epoch_loss = BatchMeanMeter()
+        record_epoch_diff_loss = BatchMeanMeter()
+        record_epoch_inv_loss = BatchMeanMeter()
+        has_inv_loss = False
         
         for batch_index, (states, actions, returns, masks) in enumerate(dataloader):
             states = states.to(device)
             actions = actions.to(device)
             returns = returns.to(device)
             masks = masks.to(device)
+            current_batch_size = states.shape[0]
             
             # 训练步骤
             result = algorithm.trainStep(states, actions, returns, masks)
@@ -128,40 +132,50 @@ def run_dit_training(
             total_loss = result[0]
             diffuse_loss, inv_loss = result[1]
             
-            record_epoch_loss += total_loss.item()
-            record_epoch_diff_loss += diffuse_loss.item()
+            record_epoch_loss.update(total_loss.item(), current_batch_size)
+            record_epoch_diff_loss.update(diffuse_loss.item(), current_batch_size)
             
             if inv_loss is not None:
-                record_epoch_inv_loss += inv_loss.item()
-            
-            num_batches += 1
+                record_epoch_inv_loss.update(inv_loss.item(), current_batch_size)
+                has_inv_loss = True
         
         # 计算平均损失
-        avg_loss = record_epoch_loss / num_batches
-        avg_diff_loss = record_epoch_diff_loss / num_batches
+        avg_loss = record_epoch_loss.mean
+        avg_diff_loss = record_epoch_diff_loss.mean
+        avg_inv_loss = record_epoch_inv_loss.mean if has_inv_loss else 0.0
+        add_scalar(writer, "dit/loss_mean", avg_loss, epoch)
+        add_scalar(writer, "dit/diff_mean", avg_diff_loss, epoch)
+        if has_inv_loss:
+            add_scalar(writer, "dit/inv_mean", avg_inv_loss, epoch)
         
         # 日志记录
         if epoch % 10 == 0:
-            log_msg = f"Epoch {epoch}: Total Loss={avg_loss:.4f}, Diff Loss={avg_diff_loss:.4f}"
-            if record_epoch_inv_loss > 0:
-                log_msg += f", Inv Loss={record_epoch_inv_loss/num_batches:.4f}"
+            log_msg = (
+                f"Epoch {epoch}: "
+                f"loss_mean={format_loss_for_log(avg_loss)}, "
+                f"diff_mean={format_loss_for_log(avg_diff_loss)}"
+            )
+            if has_inv_loss:
+                log_msg += f", inv_mean={format_loss_for_log(avg_inv_loss)}"
             logger.info(log_msg)
         
         # 保存最佳模型
         if avg_loss < best_loss:
             best_loss = avg_loss
-            algorithm.save_net(save_path, save_name='diffuser_best.pt')
-            logger.info(f"Saved best model at epoch {epoch} with loss {best_loss:.4f}")
+            algorithm.save_net(save_path, save_name='_best')
+            logger.info("Saved best model at epoch %s with loss_mean=%s", epoch, format_loss_for_log(best_loss))
         
         # 定期保存检查点
         if epoch % save_every == 0:
-            algorithm.save_net(save_path, save_name=f'diffuser_epoch_{epoch}.pt')
+            algorithm.save_net(save_path, save_name=f'_epoch_{epoch}')
             logger.info(f"Saved checkpoint at epoch {epoch}")
     
     # 保存最终模型
-    algorithm.save_net(save_path, save_name='diffuser.pt')
+    algorithm.save_net(save_path, save_name='')
     logger.info(f"Training completed! Final model saved to {save_path}/diffuser.pt")
-    logger.info(f"Best loss: {best_loss:.4f}")
+    logger.info("Best loss_mean: %s", format_loss_for_log(best_loss))
+    if writer is not None:
+        writer.close()
     
     return algorithm
 
@@ -201,6 +215,10 @@ def main():
     # 其他参数
     parser.add_argument('--save_every', type=int, default=100,
                        help='Save checkpoint every N epochs')
+    parser.add_argument('--num_workers', type=int, default=2,
+                       help='Number of DataLoader workers')
+    parser.add_argument('--tb_log_dir', type=str, default='logs/tensorboard/dit',
+                       help='TensorBoard log directory')
     parser.add_argument('--pretrained', type=str, default=None,
                        help='Path to pretrained model')
     parser.add_argument('--test_gen', action='store_true',
@@ -223,7 +241,9 @@ def main():
         predict_epsilon=args.predict_epsilon,
         traj_add_a=args.traj_add_a,
         rtg_preference=args.rtg_preference,
-        save_every=args.save_every
+        save_every=args.save_every,
+        num_workers=args.num_workers,
+        tb_log_dir=args.tb_log_dir,
     )
 
 
