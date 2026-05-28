@@ -116,7 +116,7 @@ data/
 ```bash
 mkdir -p logs
 nohup python -u run/run_decision_transformer.py \
-  --epochs 100 \
+  --epochs 200 \
   --batch_size 32 \
   --save_path saved_model/DTtest \
   > logs/run_dt_100ep.log 2>&1 &
@@ -137,7 +137,7 @@ logs/run_dt_100ep.log
 ```bash
 mkdir -p logs
 nohup python -u run/run_decision_diffuser.py \
-  --epochs 100 \
+  --epochs 200 \
   --batch_size 1000 \
   --save_path saved_model/DDtest \
   > logs/run_dd_100ep.log 2>&1 &
@@ -157,7 +157,7 @@ logs/run_dd_100ep.log
 ```bash
 mkdir -p logs
 nohup python -u run/run_dit.py \
-  --epochs 100 \
+  --epochs 200 \
   --batch_size 1000 \
   --n_timesteps 10 \
   --save_path saved_model/DiTtest \
@@ -180,7 +180,7 @@ logs/run_dit_100ep.log
 ```bash
 mkdir -p logs
 nohup python -u run/run_cbd.py \
-  --epochs 100 \
+  --epochs 200 \
   --batch_size 1000 \
   --n_timesteps 10 \
   --save_path saved_model/CBDtest \
@@ -212,7 +212,7 @@ mkdir -p logs
 nohup python -u run/run_cbd_ppo.py \
   --cbd_path saved_model/CBDtest/diffuser.pt \
   --save_path saved_model/DDPO-CBD \
-  --epochs 100 \
+  --epochs 200 \
   --batch_size 32 \
   --pretrain_rm_epochs 2 \
   --ppo_update_iters 4 \
@@ -364,13 +364,13 @@ ls data/trajectory/trajectory_data.csv
 
 # 3. 训练基线
 mkdir -p logs
-nohup python -u run/run_decision_transformer.py --epochs 100 --batch_size 32 --save_path saved_model/DTtest > logs/run_dt_100ep.log 2>&1 &
-nohup python -u run/run_decision_diffuser.py --epochs 100 --batch_size 1000 --save_path saved_model/DDtest > logs/run_dd_100ep.log 2>&1 &
-nohup python -u run/run_dit.py --epochs 100 --batch_size 1000 --n_timesteps 10 --save_path saved_model/DiTtest --save_every 20 > logs/run_dit_100ep.log 2>&1 &
-nohup python -u run/run_cbd.py --epochs 100 --batch_size 1000 --n_timesteps 10 --save_path saved_model/CBDtest --save_every 20 > logs/run_cbd_100ep.log 2>&1 &
+nohup python -u run/run_decision_transformer.py --epochs 200 --batch_size 32 --save_path saved_model/DTtest > logs/run_dt_100ep.log 2>&1 &
+nohup python -u run/run_decision_diffuser.py --epochs 200 --batch_size 1000 --save_path saved_model/DDtest > logs/run_dd_100ep.log 2>&1 &
+nohup python -u run/run_dit.py --epochs 200 --batch_size 1000 --n_timesteps 10 --save_path saved_model/DiTtest --save_every 20 > logs/run_dit_100ep.log 2>&1 &
+nohup python -u run/run_cbd.py --epochs 200 --batch_size 1000 --n_timesteps 10 --save_path saved_model/CBDtest --save_every 20 > logs/run_cbd_100ep.log 2>&1 &
 
 # CBD-PPO 阶段：读取上一步 CBD checkpoint，先训练 RM，再冻结 RM/IDM 并用 DDPO/PPO 微调 CBD policy
-nohup python -u run/run_cbd_ppo.py --cbd_path saved_model/CBDtest/diffuser.pt --save_path saved_model/DDPO-CBD --epochs 100 --batch_size 32 --pretrain_rm_epochs 2 --ppo_update_iters 4 --clip_param 0.2 --kl_coef 0.1 --condition_steps 24 > logs/run_cbd_ppo_100ep.log 2>&1 &
+nohup python -u run/run_cbd_ppo.py --cbd_path saved_model/CBDtest/diffuser.pt --save_path saved_model/DDPO-CBD --epochs 200 --batch_size 32 --pretrain_rm_epochs 2 --ppo_update_iters 4 --clip_param 0.2 --kl_coef 0.1 --condition_steps 24 > logs/run_cbd_ppo_100ep.log 2>&1 &
 
 # 4. 产出最终离线对比表
 python run/run_open_source_benchmark.py \

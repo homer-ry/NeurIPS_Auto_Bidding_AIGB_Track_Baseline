@@ -1,0 +1,23 @@
+/data/
+/test/
+/logs
+/results
+/saved_model
+# 忽略所有 .txt 文件
+*__pycache__
+
+# 忽略所有以 __ 开头的文件或目录
+__*
+
+.log*
+
+*log
+**/data/
+**/result/
+*checkpoint
+*checkpoint_*
+
+.DS_Store
+.ipynb_checkpoints/
+
+

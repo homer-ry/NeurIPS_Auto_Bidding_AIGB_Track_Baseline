@@ -34,6 +34,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from bidding_train_env.baseline.ddpo.reward_model import TrajectoryRewardModel
 from bidding_train_env.baseline.dit.DFUSER import DFUSER
 from bidding_train_env.baseline.dit.dataset import aigb_dataset
+from run.training_log_utils import parse_bool_arg
 
 
 logging.basicConfig(
@@ -312,15 +313,21 @@ def get_device(device_arg: str) -> torch.device:
     return torch.device("cpu")
 
 
-def load_cbd_model(cbd_path: str, n_timesteps: int, device: torch.device) -> DFUSER:
+def load_cbd_model(
+    cbd_path: str,
+    n_timesteps: int,
+    device: torch.device,
+    cond_obs_training: bool = True,
+) -> DFUSER:
     logger.info("Loading CBD checkpoint from %s", cbd_path)
+    logger.info("cond_obs_training: %s", cond_obs_training)
     model = DFUSER(
         dim_obs=16,
         n_timesteps=n_timesteps,
         model_choice="Unet",
         attn_block="vanilla",
         predict_epsilon=False,
-        cond_obs_training=True,
+        cond_obs_training=cond_obs_training,
         pred_one_step=False,
         traj_add_a=False,
     )
@@ -453,12 +460,18 @@ def train_cbd_ppo(
     kl_coef: float = 0.1,
     max_grad_norm: float = 1.0,
     condition_steps: int = 24,
+    cond_obs_training: bool = True,
 ):
     device_obj = get_device(device)
     os.makedirs(save_path, exist_ok=True)
     logger.info("Using device: %s", device_obj)
 
-    cbd_model = load_cbd_model(cbd_path, n_timesteps=n_timesteps, device=device_obj)
+    cbd_model = load_cbd_model(
+        cbd_path,
+        n_timesteps=n_timesteps,
+        device=device_obj,
+        cond_obs_training=cond_obs_training,
+    )
     dataloader = build_dataloader(
         cbd_model.step_len,
         batch_size=batch_size,
@@ -685,6 +698,12 @@ def main():
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--max_rm_batches", type=int, default=None)
     parser.add_argument("--max_policy_batches", type=int, default=None)
+    parser.add_argument(
+        "--max_train_batches",
+        type=int,
+        default=None,
+        help="Backward-compatible alias for --max_policy_batches.",
+    )
     parser.add_argument("--train_data_path", type=str, default="data/trajectory/trajectory_data.csv")
     parser.add_argument("--return_transform", type=str, default="log1p", choices=["log1p", "linear", "sigmoid"])
     parser.add_argument("--return_clip_quantile", type=float, default=0.99)
@@ -697,11 +716,21 @@ def main():
     parser.add_argument("--kl_coef", type=float, default=0.1)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--condition_steps", type=int, default=24)
+    parser.add_argument(
+        "--cond_obs_training",
+        type=parse_bool_arg,
+        nargs="?",
+        const=True,
+        default=True,
+        help="true for CBD checkpoints, false only when intentionally fine-tuning a DD/basic diffusion checkpoint",
+    )
     args = parser.parse_args()
 
     freeze_rm = True
     if args.update_rm:
         logger.warning("--update_rm is ignored: source-aligned DDPO freezes RM after pretraining.")
+    if args.max_train_batches is not None:
+        args.max_policy_batches = args.max_train_batches
 
     train_cbd_ppo(
         cbd_path=args.cbd_path,
@@ -728,6 +757,7 @@ def main():
         kl_coef=args.kl_coef,
         max_grad_norm=args.max_grad_norm,
         condition_steps=args.condition_steps,
+        cond_obs_training=args.cond_obs_training,
     )
 
 
