@@ -66,6 +66,7 @@ class CBDDDPOTrainer:
         kl_coef: float,
         max_grad_norm: float,
         condition_steps: int,
+        sample_value_clip: float,
     ):
         self.cbd_model = cbd_model
         self.diffuser = cbd_model.diffuser
@@ -77,6 +78,7 @@ class CBDDDPOTrainer:
         self.kl_coef = kl_coef
         self.max_grad_norm = max_grad_norm
         self.condition_steps = condition_steps
+        self.sample_value_clip = sample_value_clip
 
         for param in self.reward_model.parameters():
             param.requires_grad = False
@@ -88,6 +90,16 @@ class CBDDDPOTrainer:
             param.requires_grad = False
 
         self.optimizer = torch.optim.Adam(self.policy_model.parameters(), lr=lr)
+
+    def _sanitize_sample(self, value: torch.Tensor) -> torch.Tensor:
+        if self.sample_value_clip and self.sample_value_clip > 0:
+            return torch.nan_to_num(
+                value,
+                nan=0.0,
+                posinf=self.sample_value_clip,
+                neginf=-self.sample_value_clip,
+            ).clamp(min=-self.sample_value_clip, max=self.sample_value_clip)
+        return torch.nan_to_num(value, nan=0.0)
 
     def _prefix_len(self, masks: torch.Tensor) -> torch.Tensor:
         valid_len = masks.long().sum(dim=1).clamp(min=1)
@@ -125,6 +137,7 @@ class CBDDDPOTrainer:
             + effective_log_variance
             + np.log(2 * np.pi)
         )
+        log_prob = torch.nan_to_num(log_prob, nan=0.0, posinf=100.0, neginf=-100.0)
         return (log_prob * answer_mask).sum(dim=(1, 2))
 
     @torch.no_grad()
@@ -139,6 +152,7 @@ class CBDDDPOTrainer:
         answer_mask = self._answer_mask(masks, prefix_len)
         x = 0.5 * torch.randn(batch_size, horizon, state_dim, device=self.device)
         x = self._apply_prefix(x, states, prefix_len)
+        x = self._sanitize_sample(x)
 
         total_log_prob = torch.zeros(batch_size, device=self.device)
         steps_data: List[Dict[str, torch.Tensor]] = []
@@ -155,6 +169,7 @@ class CBDDDPOTrainer:
             nonzero_mask = (1 - (t == 0).float()).reshape(batch_size, 1, 1)
             x_next = mean + nonzero_mask * torch.exp(0.5 * log_variance) * noise
             x_next = self._apply_prefix(x_next, states, prefix_len)
+            x_next = self._sanitize_sample(x_next)
 
             if step > 0:
                 total_log_prob += self._transition_log_prob(
@@ -195,6 +210,7 @@ class CBDDDPOTrainer:
                 t=t,
                 returns=returns,
             )
+            mean = self._sanitize_sample(mean)
             log_probs = log_probs + self._transition_log_prob(
                 x_tm1=step_data["x_tm1"],
                 mean=mean,
@@ -207,13 +223,15 @@ class CBDDDPOTrainer:
     @torch.no_grad()
     def compute_rewards(self, trajectories: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
         rewards = self.reward_model(trajectories, masks)
-        return rewards.squeeze(-1)
+        rewards = torch.nan_to_num(rewards.squeeze(-1), nan=0.0, posinf=0.0, neginf=0.0)
+        return rewards
 
     def compute_advantages(self, rewards: torch.Tensor) -> torch.Tensor:
         advantages = rewards - rewards.mean()
+        advantages = torch.nan_to_num(advantages, nan=0.0, posinf=0.0, neginf=0.0)
         if advantages.numel() > 1:
             std = advantages.std(unbiased=False)
-            if std > 1e-8:
+            if torch.isfinite(std) and std > 1e-8:
                 advantages = advantages / (std + 1e-8)
         return advantages
 
@@ -230,9 +248,12 @@ class CBDDDPOTrainer:
         t = torch.randint(0, self.diffuser.n_timesteps, (batch_size,), device=self.device).long()
         noisy = self.diffuser.q_sample(trajectories.detach(), t)
         noisy = self._apply_prefix(noisy, trajectories.detach(), prefix_len)
+        noisy = self._sanitize_sample(noisy)
         pred_current = self.policy_model(noisy, t, returns)
         with torch.no_grad():
             pred_ref = self.ref_model(noisy, t, returns)
+        pred_current = torch.nan_to_num(pred_current, nan=0.0, posinf=0.0, neginf=0.0)
+        pred_ref = torch.nan_to_num(pred_ref, nan=0.0, posinf=0.0, neginf=0.0)
         return F.mse_loss(pred_current * masks[:, :, None].float(), pred_ref * masks[:, :, None].float())
 
     def train_step(
@@ -254,11 +275,41 @@ class CBDDDPOTrainer:
             rewards = self.compute_rewards(trajectories, masks)
             advantages = self.compute_advantages(rewards)
 
+        if not (
+            torch.isfinite(trajectories).all()
+            and torch.isfinite(old_log_probs).all()
+            and torch.isfinite(rewards).all()
+            and torch.isfinite(advantages).all()
+        ):
+            logger.warning(
+                "Skipping PPO batch because sampled tensors are non-finite: traj=%s old_log_prob=%s reward=%s adv=%s",
+                torch.isfinite(trajectories).all().item(),
+                torch.isfinite(old_log_probs).all().item(),
+                torch.isfinite(rewards).all().item(),
+                torch.isfinite(advantages).all().item(),
+            )
+            return {
+                "policy_loss": 0.0,
+                "kl_penalty": 0.0,
+                "total_loss": 0.0,
+                "reward_mean": 0.0,
+                "reward_std": 0.0,
+                "advantage_mean": 0.0,
+                "advantage_std": 0.0,
+                "ratio_mean": 1.0,
+                "ratio_std": 0.0,
+                "clip_fraction": 0.0,
+                "condition_steps_mean": prefix_len.float().mean().item(),
+                "skipped_update": 1.0,
+            }
+
         total_policy_loss = 0.0
         total_kl_penalty = 0.0
         ratio_means = []
         ratio_stds = []
         clip_fraction = 0.0
+        valid_updates = 0
+        skipped_updates = 0
 
         for _ in range(self.ppo_update_iters):
             new_log_probs = self.compute_log_prob_from_steps(steps_data, states, returns)
@@ -270,11 +321,26 @@ class CBDDDPOTrainer:
             policy_loss = -torch.min(surr1, surr2).mean()
             kl_penalty = self.compute_kl_penalty(trajectories, returns, masks, prefix_len)
             loss = policy_loss + self.kl_coef * kl_penalty
+            if not torch.isfinite(loss):
+                logger.warning(
+                    "Skipping PPO update because loss is non-finite: policy=%s kl=%s total=%s",
+                    policy_loss.detach().item() if bool(torch.isfinite(policy_loss).item()) else policy_loss,
+                    kl_penalty.detach().item() if bool(torch.isfinite(kl_penalty).item()) else kl_penalty,
+                    loss,
+                )
+                skipped_updates += 1
+                continue
 
             self.optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.policy_model.parameters(), self.max_grad_norm)
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.policy_model.parameters(), self.max_grad_norm)
+            if not torch.isfinite(grad_norm):
+                logger.warning("Skipping PPO update because grad_norm is non-finite: %s", grad_norm)
+                self.optimizer.zero_grad(set_to_none=True)
+                skipped_updates += 1
+                continue
             self.optimizer.step()
+            valid_updates += 1
 
             total_policy_loss += policy_loss.item()
             total_kl_penalty += kl_penalty.item()
@@ -287,18 +353,22 @@ class CBDDDPOTrainer:
                 .item()
             )
 
+        update_denominator = max(valid_updates, 1)
+        mean_policy_loss = total_policy_loss / update_denominator
+        mean_kl_penalty = total_kl_penalty / update_denominator
         return {
-            "policy_loss": total_policy_loss / self.ppo_update_iters,
-            "kl_penalty": total_kl_penalty / self.ppo_update_iters,
-            "total_loss": total_policy_loss / self.ppo_update_iters + self.kl_coef * total_kl_penalty / self.ppo_update_iters,
+            "policy_loss": mean_policy_loss,
+            "kl_penalty": mean_kl_penalty,
+            "total_loss": mean_policy_loss + self.kl_coef * mean_kl_penalty,
             "reward_mean": rewards.mean().item(),
             "reward_std": rewards.std(unbiased=False).item(),
             "advantage_mean": advantages.mean().item(),
             "advantage_std": advantages.std(unbiased=False).item(),
-            "ratio_mean": float(np.mean(ratio_means)),
-            "ratio_std": float(np.mean(ratio_stds)),
+            "ratio_mean": float(np.mean(ratio_means)) if ratio_means else 1.0,
+            "ratio_std": float(np.mean(ratio_stds)) if ratio_stds else 0.0,
             "clip_fraction": clip_fraction,
             "condition_steps_mean": prefix_len.float().mean().item(),
+            "skipped_update": skipped_updates / max(self.ppo_update_iters, 1),
         }
 
 
@@ -571,7 +641,9 @@ def evaluate_generated_reward(
     reward_model.eval()
     prefix_len = min(max(condition_steps, 1), states.shape[1])
     generated = cbd_model.diffuser.conditional_sample(cond=states[:, :prefix_len, :], returns=returns, horizon=cbd_model.step_len)
+    generated = torch.nan_to_num(generated, nan=0.0, posinf=0.0, neginf=0.0)
     predicted = reward_model(generated, masks)
+    predicted = torch.nan_to_num(predicted, nan=0.0, posinf=0.0, neginf=0.0)
     return predicted.mean().item(), predicted.std().item()
 
 
@@ -606,6 +678,7 @@ def train_cbd_ppo(
     rm_val_ratio: float = 0.05,
     rm_eval_batches: Optional[int] = None,
     tb_log_dir: str = "logs/tensorboard/cbd_ppo",
+    sample_value_clip: float = 1e6,
 ):
     device_obj = get_device(device)
     os.makedirs(save_path, exist_ok=True)
@@ -672,6 +745,7 @@ def train_cbd_ppo(
         "ratio_std": [],
         "clip_fraction": [],
         "condition_steps_mean": [],
+        "skipped_update": [],
         "diffuser_param_delta": [],
         "inv_param_delta": [],
         "rm_pretrain_loss": [item["train_loss"] for item in rm_pretrain_history],
@@ -689,6 +763,7 @@ def train_cbd_ppo(
         kl_coef=kl_coef,
         max_grad_norm=max_grad_norm,
         condition_steps=condition_steps,
+        sample_value_clip=sample_value_clip,
     )
     initial_policy_params = {
         name: param.detach().cpu().clone() for name, param in cbd_model.diffuser.model.named_parameters()
@@ -726,6 +801,7 @@ def train_cbd_ppo(
                 "ratio_std",
                 "clip_fraction",
                 "condition_steps_mean",
+                "skipped_update",
             ]
         }
         latest_reward_mean = 0.0
@@ -738,6 +814,14 @@ def train_cbd_ppo(
             returns = returns.to(device_obj)
             masks = masks.to(device_obj)
             current_batch_size = states.shape[0]
+            if not (torch.isfinite(states).all() and torch.isfinite(returns).all()):
+                logger.warning(
+                    "Skipping CBD-PPO batch %s because input tensors are non-finite: states=%s returns=%s",
+                    batch_index,
+                    torch.isfinite(states).all().item(),
+                    torch.isfinite(returns).all().item(),
+                )
+                continue
 
             stats = trainer.train_step(states=states, returns=returns, masks=masks)
             for key, meter in epoch_stats.items():
@@ -777,6 +861,7 @@ def train_cbd_ppo(
                 ppo=f"{stats['policy_loss']:.4f}",
                 kl=f"{stats['kl_penalty']:.4f}",
                 reward=f"{reward_mean:.4f}",
+                skip=f"{stats['skipped_update']:.0f}",
             )
 
             if max_policy_batches is not None and batch_index >= max_policy_batches:
@@ -895,6 +980,7 @@ def main():
     parser.add_argument("--rm_val_ratio", type=float, default=0.05)
     parser.add_argument("--rm_eval_batches", type=int, default=None)
     parser.add_argument("--tb_log_dir", type=str, default="logs/tensorboard/cbd_ppo")
+    parser.add_argument("--sample_value_clip", type=float, default=1e6)
     parser.add_argument(
         "--cond_obs_training",
         type=parse_bool_arg,
@@ -942,6 +1028,7 @@ def main():
         rm_val_ratio=args.rm_val_ratio,
         rm_eval_batches=args.rm_eval_batches,
         tb_log_dir=args.tb_log_dir,
+        sample_value_clip=args.sample_value_clip,
     )
 
 
